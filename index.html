@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Particle Hero — GPGPU 复刻</title>
+<style>
+  html,body{ margin:0; height:100%; overflow:hidden; background:#565672; }
+  #stage{ position:fixed; inset:0; }
+  canvas{ display:block; }
+  #fallback{
+    position:fixed; inset:0; display:none; place-items:center;
+    color:#fff; font-family:system-ui; text-align:center; padding:2rem;
+  }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+
+<div id="fallback">这个 demo 需要 WebGL2。请换一个现代浏览器打开。</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function(){
+'use strict';
+
+/* ============================================================
+   0. 基础设置与设备分级(照抄原站思路:分级 + 钳制 DPR)
+   ============================================================ */
+const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || Math.min(innerWidth, innerHeight) < 600;
+const reduced  = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const SIM_RES  = isMobile ? 256 : 768;          // 粒子数 = SIM_RES²:6.5万 / 59万
+const COUNT    = SIM_RES * SIM_RES;
+const DPR      = Math.min(devicePixelRatio || 1, isMobile ? 1.5 : 2);
+
+const renderer = new THREE.WebGLRenderer({ antialias:false, alpha:false, powerPreference:'high-performance' });
+if (!renderer.capabilities.isWebGL2) {
+  document.getElementById('fallback').style.display = 'grid';
+  return;
+}
+renderer.setPixelRatio(DPR);
+renderer.setSize(innerWidth, innerHeight);
+document.getElementById('stage').appendChild(renderer.domElement);
+
+const scene  = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(42, innerWidth/innerHeight, 0.1, 200);
+const CAM_BASE = new THREE.Vector3(0, 4.8, 20);
+camera.position.copy(CAM_BASE);
+const LOOK = new THREE.Vector3(0, 4.2, 0);
+
+/* 背景:canvas 渐变(紫灰 → 右上粉光),对应原站天空 */
+(function makeSky(){
+  const c = document.createElement('canvas'); c.width = 512; c.height = 512;
+  const g = c.getContext('2d');
+  const base = g.createLinearGradient(0, 512, 0, 0);
+  base.addColorStop(0, '#3c4c46');
+  base.addColorStop(.42, '#5b5b78');
+  base.addColorStop(1, '#6a6890');
+  g.fillStyle = base; g.fillRect(0,0,512,512);
+  const glow = g.createRadialGradient(390, 110, 20, 390, 110, 340);
+  glow.addColorStop(0, 'rgba(240,190,215,0.9)');
+  glow.addColorStop(.5, 'rgba(190,150,190,0.35)');
+  glow.addColorStop(1, 'rgba(190,150,190,0)');
+  g.fillStyle = glow; g.fillRect(0,0,512,512);
+  /* 虚化远景:模糊的暗色树影 + 地面暗带,承担"雾气景深"(原站由光体积承担) */
+  g.filter = 'blur(16px)';
+  g.fillStyle = 'rgba(40,60,48,0.5)';
+  const sil = [[60,16],[148,30],[236,8],[326,24],[428,14]];
+  for (const [sx, sw] of sil){ g.fillRect(sx, 160, 16 + sw, 352); }
+  g.fillStyle = 'rgba(30,52,38,0.85)';
+  g.fillRect(-40, 396, 592, 180);
+  g.filter = 'none';
+  const tex = new THREE.CanvasTexture(c);
+  scene.background = tex;
+})();
+
+/* ============================================================
+   1. 程序化生成"印象派柳树"点云(home 位置 + 颜色 + 大小 + 相位)
+   ============================================================ */
+const home   = new Float32Array(COUNT * 3);
+const colors = new Float32Array(COUNT * 3);
+const sizes  = new Float32Array(COUNT);
+const phases = new Float32Array(COUNT);
+const refUV  = new Float32Array(COUNT * 2);   // 每个粒子在模拟纹理里的坐标
+const mobility = new Float32Array(COUNT);     // 扎根度:0=焊死不动 1=正常吃风
+
+const rand = (a,b) => a + Math.random() * (b - a);
+const col = new THREE.Color();
+function setColor(i, hex, jitter){
+  col.set(hex);
+  col.offsetHSL(rand(-jitter,jitter), rand(-jitter,jitter)*.8, rand(-jitter,jitter));
+  colors[i*3] = col.r; colors[i*3+1] = col.g; colors[i*3+2] = col.b;
+}
+const pick = arr => arr[(Math.random()*arr.length)|0];
+
+const GREENS  = ['#2e5d33','#49793a','#6fa04a','#8fb56a','#3c6b3f'];
+const SPARKS  = ['#ece7da','#d873a8','#b03a2e','#22331f','#e8c8d8'];   // 树冠里的彩点
+const GROUNDS = ['#33582f','#456e36','#5d8442','#7d9a52','#2b4a2a'];
+const SKIES   = ['#cdb7d6','#e6d9e0','#8f86a8','#e39ac6','#b7c9a8'];
+
+/* 简易 2D 噪声(足够做地形起伏) */
+function noise2(x, z){
+  return Math.sin(x*0.7)*0.5 + Math.sin(z*1.3 + x*0.4)*0.3 + Math.sin((x+z)*0.23)*0.2;
+}
+function groundY(x, z){
+  const mound = 2.4 * Math.exp(-((x*x)*0.55 + (z-1)*(z-1)) / 34);
+  return mound + noise2(x, z) * 0.35 - 0.4;
+}
+
+let p = 0; // 写指针
+function push(x, y, z, size, mob){
+  home[p*3] = x; home[p*3+1] = y; home[p*3+2] = z;
+  sizes[p]  = size;
+  phases[p] = Math.random() * Math.PI * 2;
+  mobility[p] = mob === undefined ? 1 : mob;
+  refUV[p*2]   = ((p % SIM_RES) + .5) / SIM_RES;
+  refUV[p*2+1] = (((p / SIM_RES)|0) + .5) / SIM_RES;
+  return p++;
+}
+
+/* --- 地面草丘(35%) --- */
+const N_GROUND = Math.floor(COUNT * 0.35);
+for (let i = 0; i < N_GROUND; i++){
+  const x = rand(-16, 16), z = rand(-7, 7);
+  const y = groundY(x, z) + rand(0, .25);
+  const idx = push(x, y, z, rand(0.55, 1.4), 0.3);   // 草:扎根,只伏不飞
+  const edge = Math.min(1, Math.max(0, 1 - (Math.abs(x)/16)));
+  setColor(idx, Math.random() < .08 ? '#a4b06a' : pick(GROUNDS), .05);
+  // 远处压暗,做假景深
+  const fade = .55 + .45 * edge;
+  colors[idx*3] *= fade; colors[idx*3+1] *= fade; colors[idx*3+2] *= fade;
+}
+
+/* --- 柳树(45%):树干 + 垂落枝条,枝条上洒彩点 --- */
+const TREES = [
+  { x:-6.5, z:-1.5, h: 9.5, s: 1.0 },
+  { x:-2.0, z: 0.5, h: 8.0, s: 0.9 },
+  { x: 1.8, z:-2.0, h:10.5, s: 1.1 },
+  { x: 5.8, z: 0.0, h: 8.6, s: 0.95},
+  { x: 9.5, z:-3.0, h: 7.2, s: 0.8 },
+];
+const N_TREE_TOTAL = Math.floor(COUNT * 0.45);
+const perTree = Math.floor(N_TREE_TOTAL / TREES.length);
+for (const t of TREES){
+  const baseY = groundY(t.x, t.z);
+  const nTrunk = Math.floor(perTree * 0.12);
+  for (let i = 0; i < nTrunk; i++){
+    const yy = rand(0, t.h * .85);
+    const r  = rand(0, .28) * (1 - yy/t.h*.5);
+    const a  = rand(0, Math.PI*2);
+    const idx = push(t.x + Math.cos(a)*r + noise2(yy, t.x)*.15, baseY + yy, t.z + Math.sin(a)*r, rand(0.7, 1.4), 0.1);  // 树干:骨架,几乎不动
+    setColor(idx, pick(['#243a26','#31462a','#3d5232']), .04);
+  }
+  /* 垂落枝条:从树冠顶向外抛出再下坠(喷泉轨迹) */
+  const nStrandPts = 36;
+  const nStrands = Math.floor((perTree - nTrunk) / nStrandPts);
+  for (let s = 0; s < nStrands; s++){
+    const ang = rand(0, Math.PI*2);
+    const spread = rand(.25, 1.4) * t.s;
+    const topY = baseY + t.h * rand(.8, 1.0);
+    const dropLen = rand(.68, 1.05) * t.h;
+    const dx = Math.cos(ang), dz = Math.sin(ang) * .7;   // z 向压扁,面向镜头
+    const sway = rand(-.4, .4);
+    for (let k = 0; k < nStrandPts; k++){
+      const tt = k / (nStrandPts - 1);
+      const out = spread * Math.sin(Math.min(tt*1.35, 1) * Math.PI * .5);
+      const x = t.x + dx*out + sway * tt + rand(-.07,.07);
+      const y = topY - dropLen * tt*tt + rand(-.06,.06);
+      const z = t.z + dz*out + rand(-.07,.07);
+      const spark = Math.random() < .14;
+      const idx = push(x, Math.max(y, groundY(x,z)), z, spark ? rand(.85, 1.6) : rand(.45, 1.1), spark ? 1.2 : 1.0);  // 树冠:尽情吃风,彩点更轻
+      /* 大部分绿,~14% 是白/粉/红彩点 —— 点彩画的关键 */
+      setColor(idx, spark ? pick(SPARKS) : pick(GREENS), .05);
+    }
+  }
+}
+
+/* --- 天空飘散颗粒(其余):弥散 + 树顶上方的"下落彩尘"柱 --- */
+const N_SKY = COUNT - p;
+const nCols = Math.floor(N_SKY * 0.45);
+for (let i = 0; i < nCols; i++){
+  const t = pick(TREES);
+  const idx = push(t.x + rand(-1.2, 1.2), groundY(t.x,t.z) + t.h + rand(-1, 6), t.z + rand(-1.0, 1.0), rand(.3, .85), 1.3);  // 下落彩尘:最轻
+  setColor(idx, pick(SKIES.concat(SPARKS)), .06);
+}
+while (p < COUNT){
+  const idx = push(rand(-18, 18), rand(2, 15), rand(-13, -1), rand(.22, .7), 1.3);  // 天空弥散:最轻
+  setColor(idx, pick(SKIES), .06);
+  const dim = rand(.25, .6);
+  colors[idx*3]*=dim; colors[idx*3+1]*=dim; colors[idx*3+2]*=dim;
+}
+
+/* ============================================================
+   2. GPGPU:两组 ping-pong 目标(velocity / offset),每帧两个 pass
+      vel' = vel + (弹簧回位 + 阻尼 + 鼠标力场) * dt
+      off' = off + vel' * dt
+   ============================================================ */
+function makeRT(w, h, filter){
+  return new THREE.WebGLRenderTarget(w || SIM_RES, h || SIM_RES, {
+    minFilter: filter || THREE.NearestFilter, magFilter: filter || THREE.NearestFilter,
+    format: THREE.RGBAFormat, type: THREE.HalfFloatType,
+    depthBuffer:false, stencilBuffer:false
+  });
+}
+const velRT = [makeRT(), makeRT()];
+const offRT = [makeRT(), makeRT()];
+let cur = 0; // 当前读的索引
+
+/* home 位置也塞进一张静态纹理,模拟 pass 里要用它算世界坐标 */
+const homeData = new Float32Array(COUNT * 4);
+for (let i = 0; i < COUNT; i++){
+  homeData[i*4] = home[i*3]; homeData[i*4+1] = home[i*3+1];
+  homeData[i*4+2] = home[i*3+2]; homeData[i*4+3] = mobility[i];  // alpha 通道 = 扎根度
+}
+const homeTex = new THREE.DataTexture(homeData, SIM_RES, SIM_RES, THREE.RGBAFormat, THREE.FloatType);
+homeTex.minFilter = homeTex.magFilter = THREE.NearestFilter;
+homeTex.needsUpdate = true;
+
+/* 全屏 quad 的模拟小场景 */
+const simScene = new THREE.Scene();
+const simCam   = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const simGeo   = new THREE.PlaneGeometry(2, 2);
+const SIM_VERT = `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }`;
+
+const zeroMat = new THREE.ShaderMaterial({
+  vertexShader: SIM_VERT,
+  fragmentShader: `void main(){ gl_FragColor = vec4(0.); }`
+});
+
+const velMat = new THREE.ShaderMaterial({
+  vertexShader: SIM_VERT,
+  uniforms: {
+    tVel:{value:null}, tOff:{value:null}, tHome:{value:homeTex}, tFluid:{value:null},
+    uDt:{value:0}, uTime:{value:0},
+    uStiff:{value:8.0}, uDamp:{value:2.6},
+    uFluidGain:{value:0.45},  // 风场速度 → 粒子速度的换算倍率
+    uCouple:{value:10.0},     // 风"抓住"粒子的快慢
+    uLeash:{value:1.2},       // 软皮筋:允许离家多远(世界单位)
+    uWindZ:{value:0.0},       // 风场焦点深度(跟随相机,主循环每帧更新)
+    uFluidMin:{value:new THREE.Vector2(-18, -1)},   // 必须与风场域一致
+    uFluidSize:{value:new THREE.Vector2(36, 18)},
+  },
+  fragmentShader: `
+    varying vec2 vUv;
+    uniform sampler2D tVel, tOff, tHome, tFluid;
+    uniform float uDt, uTime, uStiff, uDamp, uFluidGain, uCouple, uLeash, uWindZ;
+    uniform vec2 uFluidMin, uFluidSize;
+    void main(){
+      vec3 vel  = texture2D(tVel, vUv).xyz;
+      vec3 off  = texture2D(tOff, vUv).xyz;
+      vec4 homeS = texture2D(tHome, vUv);
+      vec3 home = homeS.xyz;
+      float mob = homeS.w;    // 扎根度:树干0.1/草0.3/树冠1.0/彩点1.2/飘尘1.3
+      vec3 world = home + off;
+
+      // 弹簧回位 + 阻尼:风散了以后慢慢荡回原位
+      vel += (-uStiff * off - uDamp * vel) * uDt;
+
+      // 采样风场(世界 xy → 流体 UV):这份速度自带传播/漩涡/耗散
+      vec2 fuv = clamp((world.xy - uFluidMin) / uFluidSize, vec2(0.), vec2(1.));
+      vec2 fv = texture2D(tFluid, fuv).xy * uFluidGain;
+      float fmag = length(fv);
+
+      // 每粒固定随机数:吃风程度不一样(沙粒感)
+      float seed = fract(sin(dot(vUv, vec2(12.9898, 78.233))) * 43758.5453);
+      float gust = 0.55 + 0.9 * seed;
+
+      // 软皮筋:离家越远风越抓不住 → 原地剧烈打旋,但物体轮廓不解体
+      float leash = exp(-dot(off, off) / (uLeash * uLeash));
+      // 深度衰减:离风场焦点(跟随相机)越远越吃不到风,保住景深
+      float dz = world.z - uWindZ;
+      float depthW = exp(-dz * dz / 36.0);
+
+      // 风裹挟:把粒子速度直接朝风速拉(不是加速度),风越强抓得越牢
+      vec3 wind = vec3(fv, sin(uTime * 2.1 + seed * 6.2831) * min(fmag * 0.25, 1.2));
+      float grip = 1.0 - exp(-uCouple * uDt * min(fmag * 0.6, 1.5) * gust * mob * leash * depthW);
+      vel = mix(vel, wind, grip);
+
+      gl_FragColor = vec4(vel, 1.);
+    }`
+});
+
+const offMat = new THREE.ShaderMaterial({
+  vertexShader: SIM_VERT,
+  uniforms: { tVel:{value:null}, tOff:{value:null}, uDt:{value:0} },
+  fragmentShader: `
+    varying vec2 vUv;
+    uniform sampler2D tVel, tOff;
+    uniform float uDt;
+    void main(){
+      vec3 off = texture2D(tOff, vUv).xyz + texture2D(tVel, vUv).xyz * uDt;
+      gl_FragColor = vec4(off, 1.);
+    }`
+});
+
+const simMesh = new THREE.Mesh(simGeo, zeroMat);
+simScene.add(simMesh);
+
+function runPass(mat, target){
+  simMesh.material = mat;
+  renderer.setRenderTarget(target);
+  renderer.render(simScene, simCam);
+  renderer.setRenderTarget(null);
+}
+/* 初始化四个目标为 0 */
+[velRT[0], velRT[1], offRT[0], offRT[1]].forEach(rt => runPass(zeroMat, rt));
+
+/* ============================================================
+   2.5 风场:低分辨率 2D 流体(Navier-Stokes 简化版,同 Shopify hero 思路)
+       鼠标原始位移 splat 直接写入速度场 → 涡度增强 → 压力投影(不可压缩)
+       → 自平流。动量会在场里传播、卷漩涡、慢慢耗散;粒子只负责"读"这个场。
+       域:世界坐标 x∈[-18,18], y∈[-1,17](texel 为正方形)
+   ============================================================ */
+const FLUID_W = 192, FLUID_H = 96;
+const FLUID_MIN  = new THREE.Vector2(-18, -1);
+const FLUID_SIZE = new THREE.Vector2(36, 18);
+const F_TEXEL = new THREE.Vector2(1/FLUID_W, 1/FLUID_H);
+const SPLAT_FORCE  = 18;      // 原始位移 → 注入速度的放大倍数
+const SPLAT_RADIUS = 0.0012;  // 高斯半径(≈0.6 世界单位,针尖级)
+
+const fVelRT = [makeRT(FLUID_W, FLUID_H, THREE.LinearFilter), makeRT(FLUID_W, FLUID_H, THREE.LinearFilter)];
+const fPrsRT = [makeRT(FLUID_W, FLUID_H), makeRT(FLUID_W, FLUID_H)];
+const fDivRT  = makeRT(FLUID_W, FLUID_H);
+const fCurlRT = makeRT(FLUID_W, FLUID_H);
+let fCur = 0, pCur = 0;
+
+const splatMat = new THREE.ShaderMaterial({
+  vertexShader: SIM_VERT,
+  uniforms: {
+    tTarget:{value:null}, uPoint:{value:new THREE.Vector2()},
+    uDelta:{value:new THREE.Vector2()},
+    uRadius:{value:SPLAT_RADIUS}, uAspect:{value:FLUID_W/FLUID_H},
+  },
+  fragmentShader: `
+    varying vec2 vUv;
+    uniform sampler2D tTarget;
+    uniform vec2 uPoint, uDelta;
+    uniform float uRadius, uAspect;
+    void main(){
+      vec2 p = vUv - uPoint; p.x *= uAspect;
+      vec2 v = texture2D(tTarget, vUv).xy + exp(-dot(p,p)/uRadius) * uDelta;
+      gl_FragColor = vec4(v, 0., 1.);
+    }`
+});
+
+const curlMat = new THREE.ShaderMaterial({
+  vertexShader: SIM_VERT,
+  uniforms: { tVel:{value:null}, uTexel:{value:F_TEXEL} },
+  fragmentShader: `
+    varying vec2 vUv;
+    uniform sampler2D tVel; uniform vec2 uTexel;
+    void main(){
+      float L = texture2D(tVel, vUv - vec2(uTexel.x, 0.)).y;
+      float R = texture2D(tVel, vUv + vec2(uTexel.x, 0.)).y;
+      float B = texture2D(tVel, vUv - vec2(0., uTexel.y)).x;
+      float T = texture2D(tVel, vUv + vec2(0., uTexel.y)).x;
+      gl_FragColor = vec4(0.5*(R - L - T + B), 0., 0., 1.);
+    }`
+});
+
+const vortMat = new THREE.ShaderMaterial({
+  vertexShader: SIM_VERT,
+  uniforms: { tVel:{value:null}, tCurl:{value:null}, uTexel:{value:F_TEXEL},
+              uCurlStr:{value:14.0}, uDt:{value:0} },
+  fragmentShader: `
+    varying vec2 vUv;
+    uniform sampler2D tVel, tCurl; uniform vec2 uTexel;
+    uniform float uCurlStr, uDt;
+    void main(){
+      float L = texture2D(tCurl, vUv - vec2(uTexel.x, 0.)).x;
+      float R = texture2D(tCurl, vUv + vec2(uTexel.x, 0.)).x;
+      float B = texture2D(tCurl, vUv - vec2(0., uTexel.y)).x;
+      float T = texture2D(tCurl, vUv + vec2(0., uTexel.y)).x;
+      float C = texture2D(tCurl, vUv).x;
+      vec2 force = 0.5 * vec2(abs(T) - abs(B), abs(R) - abs(L));
+      force = force / (length(force) + 1e-4) * uCurlStr * C;
+      force.y *= -1.0;
+      vec2 vel = texture2D(tVel, vUv).xy + force * uDt;
+      gl_FragColor = vec4(clamp(vel, vec2(-100.), vec2(100.)), 0., 1.);
+    }`
+});
+
+const divMat = new THREE.ShaderMaterial({
+  vertexShader: SIM_VERT,
+  uniforms: { tVel:{value:null}, uTexel:{value:F_TEXEL} },
+  fragmentShader: `
+    varying vec2 vUv;
+    uniform sampler2D tVel; uniform vec2 uTexel;
+    void main(){
+      float L = texture2D(tVel, vUv - vec2(uTexel.x, 0.)).x;
+      float R = texture2D(tVel, vUv + vec2(uTexel.x, 0.)).x;
+      float B = texture2D(tVel, vUv - vec2(0., uTexel.y)).y;
+      float T = texture2D(tVel, vUv + vec2(0., uTexel.y)).y;
+      gl_FragColor = vec4(0.5*(R - L + T - B), 0., 0., 1.);
+    }`
+});
+
+const clearMat = new THREE.ShaderMaterial({
+  vertexShader: SIM_VERT,
+  uniforms: { tTex:{value:null}, uValue:{value:0.8} },
+  fragmentShader: `
+    varying vec2 vUv;
+    uniform sampler2D tTex; uniform float uValue;
+    void main(){ gl_FragColor = uValue * texture2D(tTex, vUv); }`
+});
+
+const prsMat = new THREE.ShaderMaterial({
+  vertexShader: SIM_VERT,
+  uniforms: { tPrs:{value:null}, tDiv:{value:null}, uTexel:{value:F_TEXEL} },
+  fragmentShader: `
+    varying vec2 vUv;
+    uniform sampler2D tPrs, tDiv; uniform vec2 uTexel;
+    void main(){
+      float L = texture2D(tPrs, vUv - vec2(uTexel.x, 0.)).x;
+      float R = texture2D(tPrs, vUv + vec2(uTexel.x, 0.)).x;
+      float B = texture2D(tPrs, vUv - vec2(0., uTexel.y)).x;
+      float T = texture2D(tPrs, vUv + vec2(0., uTexel.y)).x;
+      float div = texture2D(tDiv, vUv).x;
+      gl_FragColor = vec4((L + R + B + T - div) * 0.25, 0., 0., 1.);
+    }`
+});
+
+const gradMat = new THREE.ShaderMaterial({
+  vertexShader: SIM_VERT,
+  uniforms: { tPrs:{value:null}, tVel:{value:null}, uTexel:{value:F_TEXEL} },
+  fragmentShader: `
+    varying vec2 vUv;
+    uniform sampler2D tPrs, tVel; uniform vec2 uTexel;
+    void main(){
+      float L = texture2D(tPrs, vUv - vec2(uTexel.x, 0.)).x;
+      float R = texture2D(tPrs, vUv + vec2(uTexel.x, 0.)).x;
+      float B = texture2D(tPrs, vUv - vec2(0., uTexel.y)).x;
+      float T = texture2D(tPrs, vUv + vec2(0., uTexel.y)).x;
+      vec2 vel = texture2D(tVel, vUv).xy - vec2(R - L, T - B);
+      gl_FragColor = vec4(vel, 0., 1.);
+    }`
+});
+
+const advMat = new THREE.ShaderMaterial({
+  vertexShader: SIM_VERT,
+  uniforms: { tVel:{value:null}, tSrc:{value:null},
+              uInvDomain:{value:new THREE.Vector2(1/36, 1/18)},
+              uDt:{value:0}, uDissipation:{value:1.15} },
+  fragmentShader: `
+    varying vec2 vUv;
+    uniform sampler2D tVel, tSrc;
+    uniform vec2 uInvDomain;
+    uniform float uDt, uDissipation;
+    void main(){
+      vec2 coord = vUv - uDt * texture2D(tVel, vUv).xy * uInvDomain;
+      gl_FragColor = texture2D(tSrc, coord) / (1.0 + uDissipation * uDt);
+    }`
+});
+
+function stepFluid(dt){
+  // 1) 涡度增强:让扰动卷成漩涡而不是糊开
+  curlMat.uniforms.tVel.value = fVelRT[fCur].texture;
+  runPass(curlMat, fCurlRT);
+
+  vortMat.uniforms.tVel.value = fVelRT[fCur].texture;
+  vortMat.uniforms.tCurl.value = fCurlRT.texture;
+  vortMat.uniforms.uDt.value = dt;
+  runPass(vortMat, fVelRT[1-fCur]); fCur = 1-fCur;
+
+  // 2) 散度 → 压力(雅可比迭代) → 减压力梯度:不可压缩,推这里挤那里
+  divMat.uniforms.tVel.value = fVelRT[fCur].texture;
+  runPass(divMat, fDivRT);
+
+  clearMat.uniforms.tTex.value = fPrsRT[pCur].texture;
+  runPass(clearMat, fPrsRT[1-pCur]); pCur = 1-pCur;
+
+  prsMat.uniforms.tDiv.value = fDivRT.texture;
+  for (let i = 0; i < 20; i++){
+    prsMat.uniforms.tPrs.value = fPrsRT[pCur].texture;
+    runPass(prsMat, fPrsRT[1-pCur]); pCur = 1-pCur;
+  }
+
+  gradMat.uniforms.tPrs.value = fPrsRT[pCur].texture;
+  gradMat.uniforms.tVel.value = fVelRT[fCur].texture;
+  runPass(gradMat, fVelRT[1-fCur]); fCur = 1-fCur;
+
+  // 3) 自平流:速度场搬运自己,动量随流传播
+  advMat.uniforms.tVel.value = fVelRT[fCur].texture;
+  advMat.uniforms.tSrc.value = fVelRT[fCur].texture;
+  advMat.uniforms.uDt.value = dt;
+  runPass(advMat, fVelRT[1-fCur]); fCur = 1-fCur;
+}
+
+[fVelRT[0], fVelRT[1], fPrsRT[0], fPrsRT[1], fDivRT, fCurlRT].forEach(rt => runPass(zeroMat, rt));
+
+/* ============================================================
+   3. 粒子渲染:顶点着色器读 offset 纹理 + 环境风摆;圆点用 discard
+      (硬边 discard 保证深度写入正确 → 文字遮挡不穿帮)
+   ============================================================ */
+const geo = new THREE.BufferGeometry();
+geo.setAttribute('position', new THREE.BufferAttribute(home, 3));
+geo.setAttribute('aColor',   new THREE.BufferAttribute(colors, 3));
+geo.setAttribute('aSize',    new THREE.BufferAttribute(sizes, 1));
+geo.setAttribute('aPhase',   new THREE.BufferAttribute(phases, 1));
+geo.setAttribute('aRef',     new THREE.BufferAttribute(refUV, 2));
+
+const pointsMat = new THREE.ShaderMaterial({
+  uniforms: {
+    tOff:{value:null},
+    uTime:{value:0},
+    uWind:{value: reduced ? 0.0 : 1.0},
+    uScale:{value: innerHeight * DPR * 0.07},
+    uFogColor:{value: new THREE.Color(0x49523f)},  // 背景图加载后会替换成其平均色
+    uFogNear:{value: 14.0},
+    uFogFar:{value: 46.0},
+  },
+  vertexShader: `
+    attribute vec3 aColor;
+    attribute float aSize, aPhase;
+    attribute vec2 aRef;
+    uniform sampler2D tOff;
+    uniform float uTime, uWind, uScale, uFogNear, uFogFar;
+    varying vec3 vColor;
+    varying float vFog;
+    void main(){
+      vColor = aColor;
+      vec3 off = texture2D(tOff, aRef).xyz;
+      // 环境风:随高度增大的轻微摆动,让静止时也是活的
+      float h = smoothstep(0.0, 8.0, position.y);
+      vec3 wind = vec3(
+        sin(uTime * .6 + aPhase) * .07,
+        sin(uTime * .8 + aPhase * 1.7) * .04,
+        cos(uTime * .5 + aPhase) * .05
+      ) * h * uWind;
+      vec4 mv = modelViewMatrix * vec4(position + off + wind, 1.);
+      float dist = -mv.z;
+      // 深度雾:远处的点融进背景色(朦胧的来源之一)
+      vFog = smoothstep(uFogNear, uFogFar, dist) * .78;
+      // 近相机淡出(camera fade):推进穿过粒子时缩小消失,不爆大方块
+      float nearFade = smoothstep(1.2, 5.5, dist);
+      gl_PointSize = clamp(aSize * uScale / max(dist, .5), 1.0, 9.0) * nearFade;
+      gl_Position = projectionMatrix * mv;
+    }`,
+  fragmentShader: `
+    varying vec3 vColor;
+    varying float vFog;
+    uniform vec3 uFogColor;
+    void main(){
+      vec2 d = gl_PointCoord - .5;
+      if (dot(d, d) > .25) discard;   // 硬边圆片(原站同款 gl.POINTS 质感)
+      gl_FragColor = vec4(mix(vColor, uFogColor, vFog), 1.);
+    }`,
+});
+const points = new THREE.Points(geo, pointsMat);
+points.frustumCulled = false;
+scene.add(points);
+
+/* ============================================================
+   3.5 真实点云热替换:VGGT 从实拍视频重建的森林(forest_points.bin)
+       到货后整体覆盖程序化场景;背景换成同源视频的重度模糊帧。
+       bin 不存在时(比如 file:// 直开)自动保持程序化树,不报错。
+   ============================================================ */
+const cloud = { ready:false, zNear:18.0, zFar:-14.0, eyeY:4.4 };
+
+fetch('forest_points.bin').then(r => {
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.arrayBuffer();
+}).then(buf => {
+  const n = new Uint32Array(buf, 0, 1)[0];
+  const pos = new Float32Array(buf, 4, n * 3);
+  const rgb = new Uint8Array(buf, 4 + n * 12, n * 3);
+  const N = Math.min(n, COUNT);
+  const ys = [], zs = [];
+  for (let i = 0; i < N; i++){
+    const x = pos[i*3], y = pos[i*3+1], z = pos[i*3+2];
+    home[i*3] = x; home[i*3+1] = y; home[i*3+2] = z;
+    colors[i*3] = rgb[i*3]/255; colors[i*3+1] = rgb[i*3+1]/255; colors[i*3+2] = rgb[i*3+2]/255;
+    sizes[i] = .5 + Math.random() * .6;
+    mobility[i] = y < .8 ? .35 : 1.0;   // 贴地的点少吃风
+    homeData[i*4] = x; homeData[i*4+1] = y; homeData[i*4+2] = z; homeData[i*4+3] = mobility[i];
+    if ((i & 127) === 0){ ys.push(y); zs.push(z); }
+  }
+  ys.sort((a,b) => a-b); zs.sort((a,b) => a-b);
+  const q = (arr, t) => arr[Math.floor(t * (arr.length - 1))];
+  cloud.zNear = q(zs, .97);
+  cloud.zFar  = q(zs, .03);
+  cloud.eyeY  = q(ys, .35) + 2.2;      // 视线略高于中低层,像走在小径上
+  cloud.resetPos = true;               // 通知主循环把相机放到小径入口
+  pointsMat.uniforms.uFogFar.value = Math.max(30, (cloud.zNear - cloud.zFar) * .95);
+  homeTex.needsUpdate = true;
+  geo.attributes.position.needsUpdate = true;
+  geo.attributes.aColor.needsUpdate = true;
+  geo.attributes.aSize.needsUpdate = true;
+  cloud.ready = true;
+  console.log('森林点云已加载', N, JSON.stringify(cloud));
+}).catch(e => console.warn('点云未加载,保持程序化场景:', e.message));
+
+new THREE.TextureLoader().load('forest_bg.jpg', tex => {
+  scene.background = tex;
+  // 取背景平均色作为雾色,点和背景自然融为一体
+  const cv = document.createElement('canvas'); cv.width = cv.height = 1;
+  const g = cv.getContext('2d');
+  g.drawImage(tex.image, 0, 0, 1, 1);
+  const px = g.getImageData(0, 0, 1, 1).data;
+  pointsMat.uniforms.uFogColor.value.setRGB(px[0]/255, px[1]/255, px[2]/255);
+}, undefined, () => {});
+
+/* ============================================================
+   5. 交互:指针 → 射线打在 z≈0 平面 → 原始位移直接排队注入风场
+      (零平滑:每个 pointermove 事件的原始 delta 都变成一次 splat)
+   ============================================================ */
+const MOUSE_WIND = false;   // 鼠标扰动粒子开关(拖拽转视角时会误触发,先关;想开改 true)
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);  // 树所在的 z≈0 平面
+const hit = new THREE.Vector3();
+const prevHit = new THREE.Vector3();
+let hasPrev = false;
+const splatQueue = [];
+
+function onPointer(e){
+  const x = (e.touches ? e.touches[0].clientX : e.clientX);
+  const y = (e.touches ? e.touches[0].clientY : e.clientY);
+  ndc.set(x/innerWidth*2 - 1, -(y/innerHeight)*2 + 1);
+  if (!MOUSE_WIND) return;
+  raycaster.setFromCamera(ndc, camera);
+  if (raycaster.ray.intersectPlane(plane, hit)){
+    if (hasPrev){
+      let dx = hit.x - prevHit.x, dy = hit.y - prevHit.y;
+      const len = Math.hypot(dx, dy);
+      if (len > 1e-4){
+        if (len > 3){ dx *= 3/len; dy *= 3/len; }   // 跨屏跳变限幅
+        if (splatQueue.length < 8) splatQueue.push({ x: hit.x, y: hit.y, dx, dy });
+      }
+    }
+    prevHit.copy(hit);
+    hasPrev = true;
+  }
+}
+addEventListener('pointermove', onPointer, { passive:true });
+addEventListener('touchmove', onPointer, { passive:true });
+
+/* 键盘自由漫游:↑↓/W S 前后,←→/A D 平移;Q/E 或按住鼠标拖拽 = 转头 */
+const keys = {};
+const camPos = new THREE.Vector3(0, 0, 16.5);   // 点云加载后会被移到小径入口
+const camVel = new THREE.Vector3();
+let yaw = 0, yawTarget = 0;                      // 转头角(弧度),主循环里平滑跟随
+let pitch = 0, pitchTarget = 0;                  // 抬头低头角(>0 抬头)
+let dragging = false, dragX = 0, dragY = 0;
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code.indexOf('Arrow') === 0) e.preventDefault();
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+addEventListener('pointerdown', e => { dragging = true; dragX = e.clientX; dragY = e.clientY; });
+addEventListener('pointerup',   () => { dragging = false; });
+addEventListener('pointermove', e => {
+  if (dragging){
+    yawTarget   += (e.clientX - dragX) * -0.00175;
+    pitchTarget += (e.clientY - dragY) *  0.0015;  // 街景手感:把画面往下拽 = 抬头
+    dragX = e.clientX; dragY = e.clientY;
+  }
+}, { passive:true });
+
+/* ============================================================
+   6. 主循环
+   ============================================================ */
+const clock = new THREE.Clock();
+function tick(now, once){
+  if (!once) requestAnimationFrame(tick);
+  const dt = Math.min(clock.getDelta(), 1/30);
+  const t  = clock.elapsedTime;
+
+  // 鼠标原始位移 → 风场 splat(零平滑、零延迟、针尖半径)
+  for (const s of splatQueue){
+    splatMat.uniforms.tTarget.value = fVelRT[fCur].texture;
+    splatMat.uniforms.uPoint.value.set((s.x - FLUID_MIN.x) / FLUID_SIZE.x, (s.y - FLUID_MIN.y) / FLUID_SIZE.y);
+    splatMat.uniforms.uDelta.value.set(s.dx, s.dy).multiplyScalar(SPLAT_FORCE);
+    runPass(splatMat, fVelRT[1-fCur]); fCur = 1-fCur;
+  }
+  splatQueue.length = 0;
+
+  // 风场演化:涡度 → 压力投影 → 自平流(动量传播的来源)
+  stepFluid(dt);
+
+  // --- GPGPU 两个 pass ---
+  const read = cur, write = 1 - cur;
+  velMat.uniforms.tVel.value = velRT[read].texture;
+  velMat.uniforms.tOff.value = offRT[read].texture;
+  velMat.uniforms.tFluid.value = fVelRT[fCur].texture;
+  velMat.uniforms.uDt.value = dt;
+  velMat.uniforms.uTime.value = t;
+  runPass(velMat, velRT[write]);
+
+  offMat.uniforms.tVel.value = velRT[write].texture;
+  offMat.uniforms.tOff.value = offRT[read].texture;
+  offMat.uniforms.uDt.value = dt;
+  runPass(offMat, offRT[write]);
+  cur = write;
+
+  pointsMat.uniforms.tOff.value = offRT[cur].texture;
+  pointsMat.uniforms.uTime.value = t;
+
+  // 相机:键盘漫游 + 转头(Q/E 或拖拽),全部平滑缓动
+  const drift = reduced ? 0 : 1;
+  if (cloud.resetPos){ camPos.set(0, 0, cloud.zNear - 1.5); camVel.set(0,0,0); yaw = yawTarget = pitch = pitchTarget = 0; cloud.resetPos = false; }
+  yawTarget += ((keys.KeyE ? 1 : 0) - (keys.KeyQ ? 1 : 0)) * 1.6 * dt;
+  pitchTarget += ((keys.KeyR ? 1 : 0) - (keys.KeyF ? 1 : 0)) * 1.2 * dt;
+  // 软限位:点云只覆盖"走廊视野"——左右±60°;上 32°(树冠重建偏稀)/下 46°(地面最密)
+  yawTarget   = Math.min(Math.max(yawTarget, -1.05), 1.05);
+  pitchTarget = Math.min(Math.max(pitchTarget, -0.80), 0.55);
+  yaw   += (yawTarget - yaw)     * (1 - Math.exp(-6.0 * dt));
+  pitch += (pitchTarget - pitch) * (1 - Math.exp(-6.0 * dt));
+  const dirX = Math.sin(yaw), dirZ = -Math.cos(yaw);   // 视线水平方向(yaw>0 朝右)
+
+  const fwd    = (keys.ArrowUp   || keys.KeyW ? 1 : 0) - (keys.ArrowDown  || keys.KeyS ? 1 : 0);
+  const strafe = (keys.ArrowRight|| keys.KeyD ? 1 : 0) - (keys.ArrowLeft  || keys.KeyA ? 1 : 0);
+  const ease = 1 - Math.exp(-5.0 * dt);
+  // 前进沿视线方向,平移沿视线右侧 → 转头后走的方向跟着视线
+  camVel.x += ((fwd * dirX * 4.5 + strafe * -dirZ * 3.5) - camVel.x) * ease;
+  camVel.z += ((fwd * dirZ * 4.5 + strafe *  dirX * 3.5) - camVel.z) * ease;
+  camPos.z = Math.min(Math.max(camPos.z + camVel.z * dt, cloud.zFar + 9.0), cloud.zNear + 4.0);
+  camPos.x = Math.min(Math.max(camPos.x + camVel.x * dt, -12.0), 12.0);
+
+  camera.position.set(
+    camPos.x + Math.sin(t * .07) * .35 * drift + ndc.x * 1.1,
+    cloud.eyeY + Math.cos(t * .05) * .25 * drift - ndc.y * .6,
+    camPos.z
+  );
+  const cosP = Math.cos(pitch);
+  camera.lookAt(
+    camPos.x + dirX * cosP * 14.0 + ndc.x * 2.0,
+    cloud.eyeY - .6 + Math.sin(pitch) * 14.0,
+    camPos.z + dirZ * cosP * 14.0
+  );
+
+  // 风场焦点和鼠标命中平面跟着视线焦点走
+  const windZ = camPos.z + dirZ * 11.0;
+  velMat.uniforms.uWindZ.value = windZ;
+  plane.constant = -windZ;
+
+  renderer.render(scene, camera);
+}
+tick();
+window.__renderOnce = () => tick(0, true);   // 调试:后台标签页手动渲一帧
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  pointsMat.uniforms.uScale.value = innerHeight * DPR * 0.07;
+});
+})();
+</script>
+</body>
+</html>
