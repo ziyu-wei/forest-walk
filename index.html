@@ -249,7 +249,8 @@ const velMat = new THREE.ShaderMaterial({
       float depthW = exp(-dz * dz / 36.0);
 
       // 风裹挟:把粒子速度直接朝风速拉(不是加速度),风越强抓得越牢
-      vec3 wind = vec3(fv, sin(uTime * 2.1 + seed * 6.2831) * min(fmag * 0.25, 1.2));
+      // 扎根度同时缩"目标风速"和"响应速度":刚体粒子不管吹多久都到不了可见位移
+      vec3 wind = vec3(fv, sin(uTime * 2.1 + seed * 6.2831) * min(fmag * 0.25, 1.2)) * mob;
       float grip = 1.0 - exp(-uCouple * uDt * min(fmag * 0.6, 1.5) * gust * mob * leash * depthW);
       vel = mix(vel, wind, grip);
 
@@ -590,14 +591,14 @@ fetch('forest_points.bin').then(r => {
     // 叶子要同时满足两个条件:绿色优势 + 高饱和(苔藓灰绿树干是低饱和,会被拦下)
     const R = rgb[i*3] / 255, G = rgb[i*3+1] / 255, B = rgb[i*3+2] / 255;
     if (y < .8){
-      mobility[i] = .12;                    // 小径/地面:焊死
+      mobility[i] = .04;                    // 小径/地面:焊死
     } else {
       const mx = Math.max(R, G, B), mn = Math.min(R, G, B);
       const sat = (mx - mn) / Math.max(mx, 1e-3);
       const greenness = G - Math.max(R, B);
       const leaf = Math.min(Math.max((greenness - .01) / .10, 0), 1) *
                    Math.min(Math.max((sat - .18) / .22, 0), 1);
-      mobility[i] = .08 + 1.05 * leaf * leaf;   // 树干/灰绿 0.08 ←→ 鲜绿叶子 ~1.13
+      mobility[i] = .04 + 1.09 * leaf * leaf;   // 树干/灰绿 0.04 ←→ 鲜绿叶子 ~1.13
     }
     homeData[i*4] = x; homeData[i*4+1] = y; homeData[i*4+2] = z; homeData[i*4+3] = mobility[i];
     if ((i & 127) === 0){ ys.push(y); zs.push(z); }
