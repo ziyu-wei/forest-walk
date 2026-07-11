@@ -487,7 +487,7 @@ const pointsMat = new THREE.ShaderMaterial({
     uFogFar:{value: 46.0},
     uReveal:{value: 0.0},                          // 0=加载尘埃 → 1=森林成形
     uDustColor:{value: new THREE.Color(0.84, 0.85, 0.72)},  // 尘埃的暖金绿
-    uFlowStrength:{value: 0.7},                    // rise 流强度(原站 0.19,按世界尺度放大)
+    uFlowStrength:{value: 1.0},                    // rise 流强度(上升高度,原站 0.19,按世界尺度放大)
   },
   vertexShader: `
     attribute vec3 aColor;
@@ -532,10 +532,10 @@ const pointsMat = new THREE.ShaderMaterial({
       //    → 整个画面永远在"呼吸消散",但没有任何点真正离开自己的位置
       // ② 极稀疏(pow(rand,300),约 2% 的点):随相位缓缓升起再淡出
       //    → 你看到的"向上飘散的粒子流";99% 的点纹丝不动,构图永不改变
-      float rise = fract(uTime * 0.04 + r3 * 7.0);   // r3*7:相位均匀错峰(原站 pow(r,10)*20 会让一半点同步潮汐,点少时画面会周期性变空)
+      float rise = fract(uTime * 0.09 + r3 * 7.0);   // 0.09→11s 一循环(原站 0.04=25s 太慢看不出动);r3*7 均匀错峰
       float life = smoothstep(0.0, 0.08, rise) * (1.0 - smoothstep(0.82, 1.0, rise));
       life = mix(1.0, life, r);   // 尘埃凝聚完成前不参与
-      float sparse = pow(r2, 300.0) * r;
+      float sparse = pow(r2, 60.0) * r;   // 指数 60→约 11% 的点参与上升(原站 300→2%,我们点少要多些才看得见)
       pos.y += rise * sparse * uFlowStrength * 7.0 * mix(0.4, 1.2, r1);
       pos.y += sin(uTime + r2 * 20.0) * sparse * uFlowStrength * 0.08;
 
