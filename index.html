@@ -210,7 +210,7 @@ const velMat = new THREE.ShaderMaterial({
     tVel:{value:null}, tOff:{value:null}, tHome:{value:homeTex}, tFluid:{value:null},
     uDt:{value:0}, uTime:{value:0},
     uStiff:{value:8.0}, uDamp:{value:2.6},
-    uFluidGain:{value:0.45},  // 风场速度 → 粒子速度的换算倍率
+    uFluidGain:{value:0.35},  // 风场速度 → 粒子速度的换算倍率
     uCouple:{value:10.0},     // 风"抓住"粒子的快慢
     uLeash:{value:1.2},       // 软皮筋:允许离家多远(世界单位)
     uWindZ:{value:0.0},       // 风场焦点深度(跟随相机,主循环每帧更新)
@@ -292,7 +292,7 @@ const FLUID_W = 192, FLUID_H = 96;
 const FLUID_MIN  = new THREE.Vector2(-18, -1);
 const FLUID_SIZE = new THREE.Vector2(36, 18);
 const F_TEXEL = new THREE.Vector2(1/FLUID_W, 1/FLUID_H);
-const SPLAT_FORCE  = 18;      // 原始位移 → 注入速度的放大倍数
+const SPLAT_FORCE  = 6;       // 原始位移 → 注入速度的放大倍数(温和档;18=狂野档)
 const SPLAT_RADIUS = 0.0012;  // 高斯半径(≈0.6 世界单位,针尖级)
 
 const fVelRT = [makeRT(FLUID_W, FLUID_H, THREE.LinearFilter), makeRT(FLUID_W, FLUID_H, THREE.LinearFilter)];
@@ -557,6 +557,7 @@ scene.add(points);
    ============================================================ */
 const cloud = { ready:false, zNear:18.0, zFar:-14.0, eyeY:4.4 };
 let reveal = 0;   // 尘埃→森林的凝聚进度,点云到货后在主循环里推进
+let bgSphere = null;   // 背景环绕球(加载后创建),转头时方向感正确
 
 fetch('forest_points.bin').then(r => {
   if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -592,7 +593,14 @@ fetch('forest_points.bin').then(r => {
 }).catch(e => console.warn('点云未加载,保持程序化场景:', e.message));
 
 new THREE.TextureLoader().load('forest_bg.jpg', tex => {
-  scene.background = tex;
+  // 背景装进环绕球(而非贴屏幕):转头/移动时背景有正确的方向感
+  // 原站的思路等价——它的氛围全是 3D 实体(暗底色+raymarch 视频光体积),没有 2D 背景图
+  tex.wrapS = THREE.MirroredRepeatWrapping;
+  tex.repeat.set(3, 1);   // 水平镜像平铺 3 次,绕一圈无接缝
+  const mat = new THREE.MeshBasicMaterial({ map: tex, side: THREE.BackSide, depthWrite: false });
+  bgSphere = new THREE.Mesh(new THREE.SphereGeometry(150, 32, 24), mat);
+  bgSphere.renderOrder = -10;
+  scene.add(bgSphere);
   // 取背景平均色作为雾色,点和背景自然融为一体
   const cv = document.createElement('canvas'); cv.width = cv.height = 1;
   const g = cv.getContext('2d');
@@ -605,7 +613,7 @@ new THREE.TextureLoader().load('forest_bg.jpg', tex => {
    5. 交互:指针 → 射线打在 z≈0 平面 → 原始位移直接排队注入风场
       (零平滑:每个 pointermove 事件的原始 delta 都变成一次 splat)
    ============================================================ */
-const MOUSE_WIND = false;   // 鼠标扰动粒子开关(拖拽转视角时会误触发,先关;想开改 true)
+const MOUSE_WIND = true;    // 鼠标滑过扰动粒子(温和档);拖拽转视角时自动不扰动
 const raycaster = new THREE.Raycaster();
 const ndc = new THREE.Vector2();
 const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);  // 树所在的 z≈0 平面
@@ -621,7 +629,7 @@ function onPointer(e){
   if (!MOUSE_WIND) return;
   raycaster.setFromCamera(ndc, camera);
   if (raycaster.ray.intersectPlane(plane, hit)){
-    if (hasPrev){
+    if (hasPrev && !dragging){   // 拖拽转视角时不扰动,只有纯滑动才搅粒子
       let dx = hit.x - prevHit.x, dy = hit.y - prevHit.y;
       const len = Math.hypot(dx, dy);
       if (len > 1e-4){
@@ -650,6 +658,15 @@ addEventListener('keydown', e => {
 addEventListener('keyup', e => { keys[e.code] = false; });
 addEventListener('pointerdown', e => { dragging = true; dragX = e.clientX; dragY = e.clientY; });
 addEventListener('pointerup',   () => { dragging = false; });
+
+/* 滚轮导航:主滚轮=前进后退;MX Master 侧滚轮(deltaX)=左右横移 */
+let wheelF = 0, wheelS = 0;   // 每帧消化的滚轮累计量
+let idleTime = 0;             // 无操作计时 → 待机自动向前缓漂
+addEventListener('wheel', e => {
+  e.preventDefault();
+  wheelF += e.deltaY;
+  wheelS += e.deltaX;
+}, { passive: false });
 addEventListener('pointermove', e => {
   if (dragging){
     yawTarget   += (e.clientX - dragX) * -0.00175;
@@ -715,24 +732,37 @@ function tick(now, once){
 
   const fwd    = (keys.ArrowUp   || keys.KeyW ? 1 : 0) - (keys.ArrowDown  || keys.KeyS ? 1 : 0);
   const strafe = (keys.ArrowRight|| keys.KeyD ? 1 : 0) - (keys.ArrowLeft  || keys.KeyA ? 1 : 0);
+
+  // 待机 3 秒后自动向前缓漂(原站"永恒外流"=相机一直在动);任何输入立刻接管
+  const active = fwd || strafe || dragging || wheelF || wheelS ||
+                 keys.KeyQ || keys.KeyE || keys.KeyR || keys.KeyF;
+  idleTime = active ? 0 : idleTime + dt;
+  const idleDrift = idleTime > 3 ? Math.min(1, (idleTime - 3) / 5) * .55 : 0;
+
   const ease = 1 - Math.exp(-5.0 * dt);
   // 前进沿视线方向,平移沿视线右侧 → 转头后走的方向跟着视线
-  camVel.x += ((fwd * dirX * 4.5 + strafe * -dirZ * 3.5) - camVel.x) * ease;
-  camVel.z += ((fwd * dirZ * 4.5 + strafe *  dirX * 3.5) - camVel.z) * ease;
+  const vF = fwd * 4.5 + idleDrift;
+  camVel.x += ((vF * dirX + strafe * -dirZ * 3.5) - camVel.x) * ease;
+  camVel.z += ((vF * dirZ + strafe *  dirX * 3.5) - camVel.z) * ease;
+  // 滚轮:向上滚=前进;侧滚轮=横移(速度冲量,自带滑行衰减)
+  camVel.x += (-wheelF * dirX + wheelS * -dirZ) * .012;
+  camVel.z += (-wheelF * dirZ + wheelS *  dirX) * .012;
+  wheelF = 0; wheelS = 0;
   camPos.z = Math.min(Math.max(camPos.z + camVel.z * dt, cloud.zFar + 9.0), cloud.zNear + 4.0);
   camPos.x = Math.min(Math.max(camPos.x + camVel.x * dt, -12.0), 12.0);
 
   camera.position.set(
-    camPos.x + Math.sin(t * .07) * .35 * drift + ndc.x * 1.1,
-    cloud.eyeY + Math.cos(t * .05) * .25 * drift - ndc.y * .6,
+    camPos.x + Math.sin(t * .07) * .35 * drift,
+    cloud.eyeY + Math.cos(t * .05) * .25 * drift,
     camPos.z
   );
   const cosP = Math.cos(pitch);
   camera.lookAt(
-    camPos.x + dirX * cosP * 14.0 + ndc.x * 2.0,
+    camPos.x + dirX * cosP * 14.0,
     cloud.eyeY - .6 + Math.sin(pitch) * 14.0,
     camPos.z + dirZ * cosP * 14.0
   );
+  if (bgSphere) bgSphere.position.copy(camera.position);   // 天空球跟着相机平移,只留转动视差
 
   // 风场焦点和鼠标命中平面跟着视线焦点走
   const windZ = camPos.z + dirZ * 11.0;
