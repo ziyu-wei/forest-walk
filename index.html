@@ -586,7 +586,15 @@ fetch('forest_points.bin').then(r => {
     home[i*3] = x; home[i*3+1] = y; home[i*3+2] = z;
     colors[i*3] = rgb[i*3]/255; colors[i*3+1] = rgb[i*3+1]/255; colors[i*3+2] = rgb[i*3+2]/255;
     sizes[i] = .5 + Math.random() * .6;
-    mobility[i] = y < .8 ? .35 : 1.0;   // 贴地的点少吃风
+    // 扎根度按"高度+颜色"分类:绿叶随风大摆,树干/小径几乎不动
+    const R = rgb[i*3] / 255, G = rgb[i*3+1] / 255, B = rgb[i*3+2] / 255;
+    const greenness = G - Math.max(R, B);   // 绿色优势 → 越像叶子
+    if (y < .8){
+      mobility[i] = .12;                    // 小径/地面:焊死
+    } else {
+      const leaf = Math.min(Math.max((greenness + .02) / .10, 0), 1);
+      mobility[i] = .08 + 1.05 * leaf * leaf;   // 棕灰树干 0.08 ←→ 鲜绿叶子 ~1.13
+    }
     homeData[i*4] = x; homeData[i*4+1] = y; homeData[i*4+2] = z; homeData[i*4+3] = mobility[i];
     if ((i & 127) === 0){ ys.push(y); zs.push(z); }
   }
