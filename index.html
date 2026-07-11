@@ -487,13 +487,14 @@ const pointsMat = new THREE.ShaderMaterial({
     uFogFar:{value: 46.0},
     uReveal:{value: 0.0},                          // 0=加载尘埃 → 1=森林成形
     uDustColor:{value: new THREE.Color(0.84, 0.85, 0.72)},  // 尘埃的暖金绿
+    uFlowStrength:{value: 0.7},                    // rise 流强度(原站 0.19,按世界尺度放大)
   },
   vertexShader: `
     attribute vec3 aColor;
     attribute float aSize, aPhase;
     attribute vec2 aRef;
     uniform sampler2D tOff;
-    uniform float uTime, uWind, uScale, uFogNear, uFogFar, uReveal;
+    uniform float uTime, uWind, uScale, uFogNear, uFogFar, uReveal, uFlowStrength;
     uniform vec3 uDustColor;
     varying vec3 vColor;
     varying float vFog, vHide;
@@ -526,13 +527,25 @@ const pointsMat = new THREE.ShaderMaterial({
       float show = max(step(fract(r2 * 7.31), 0.05), step(0.02, r));
       vHide = 1.0 - show;
 
+      // ==== rise 流(逆向自原站线上 shader,机制原样照搬) ====
+      // ① 全员:各有一个 25 秒相位循环,循环尾端缩小消失→原位重生
+      //    → 整个画面永远在"呼吸消散",但没有任何点真正离开自己的位置
+      // ② 极稀疏(pow(rand,300),约 2% 的点):随相位缓缓升起再淡出
+      //    → 你看到的"向上飘散的粒子流";99% 的点纹丝不动,构图永不改变
+      float rise = fract(uTime * 0.04 + r3 * 7.0);   // r3*7:相位均匀错峰(原站 pow(r,10)*20 会让一半点同步潮汐,点少时画面会周期性变空)
+      float life = smoothstep(0.0, 0.08, rise) * (1.0 - smoothstep(0.82, 1.0, rise));
+      life = mix(1.0, life, r);   // 尘埃凝聚完成前不参与
+      float sparse = pow(r2, 300.0) * r;
+      pos.y += rise * sparse * uFlowStrength * 7.0 * mix(0.4, 1.2, r1);
+      pos.y += sin(uTime + r2 * 20.0) * sparse * uFlowStrength * 0.08;
+
       vec4 mv = modelViewMatrix * vec4(pos, 1.);
       float dist = -mv.z;
       // 深度雾:远处的点融进背景色(朦胧的来源之一)
       vFog = smoothstep(uFogNear, uFogFar, dist) * .78;
       // 近相机淡出(camera fade):推进穿过粒子时缩小消失,不爆大方块
       float nearFade = smoothstep(1.2, 5.5, dist);
-      gl_PointSize = clamp(aSize * uScale / max(dist, .5), 1.0, 9.0) * nearFade * mix(.8, 1.0, r);
+      gl_PointSize = clamp(aSize * uScale / max(dist, .5), 1.0, 9.0) * nearFade * mix(.8, 1.0, r) * life;
       gl_Position = projectionMatrix * mv;
     }`,
   fragmentShader: `
@@ -661,7 +674,6 @@ addEventListener('pointerup',   () => { dragging = false; });
 
 /* 滚轮导航:主滚轮=前进后退;MX Master 侧滚轮(deltaX)=左右横移 */
 let wheelF = 0, wheelS = 0;   // 每帧消化的滚轮累计量
-let idleTime = 0;             // 无操作计时 → 待机自动向前缓漂
 addEventListener('wheel', e => {
   e.preventDefault();
   wheelF += e.deltaY;
@@ -733,15 +745,10 @@ function tick(now, once){
   const fwd    = (keys.ArrowUp   || keys.KeyW ? 1 : 0) - (keys.ArrowDown  || keys.KeyS ? 1 : 0);
   const strafe = (keys.ArrowRight|| keys.KeyD ? 1 : 0) - (keys.ArrowLeft  || keys.KeyA ? 1 : 0);
 
-  // 待机 3 秒后自动向前缓漂(原站"永恒外流"=相机一直在动);任何输入立刻接管
-  const active = fwd || strafe || dragging || wheelF || wheelS ||
-                 keys.KeyQ || keys.KeyE || keys.KeyR || keys.KeyF;
-  idleTime = active ? 0 : idleTime + dt;
-  const idleDrift = idleTime > 3 ? Math.min(1, (idleTime - 3) / 5) * .55 : 0;
-
   const ease = 1 - Math.exp(-5.0 * dt);
   // 前进沿视线方向,平移沿视线右侧 → 转头后走的方向跟着视线
-  const vF = fwd * 4.5 + idleDrift;
+  // (待机不再自动前进:原站的"永恒消散"是粒子 rise 流做的,相机根本不动)
+  const vF = fwd * 4.5;
   camVel.x += ((vF * dirX + strafe * -dirZ * 3.5) - camVel.x) * ease;
   camVel.z += ((vF * dirZ + strafe *  dirX * 3.5) - camVel.z) * ease;
   // 滚轮:向上滚=前进;侧滚轮=横移(速度冲量,自带滑行衰减)
@@ -773,6 +780,7 @@ function tick(now, once){
 }
 tick();
 window.__renderOnce = () => tick(0, true);   // 调试:后台标签页手动渲一帧
+window.__dbg = () => JSON.stringify({ ready: cloud.ready, reveal: reveal, uR: pointsMat.uniforms.uReveal.value });
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth/innerHeight;
