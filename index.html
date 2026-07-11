@@ -532,10 +532,10 @@ const pointsMat = new THREE.ShaderMaterial({
       //    → 整个画面永远在"呼吸消散",但没有任何点真正离开自己的位置
       // ② 极稀疏(pow(rand,300),约 2% 的点):随相位缓缓升起再淡出
       //    → 你看到的"向上飘散的粒子流";99% 的点纹丝不动,构图永不改变
-      float rise = fract(uTime * 0.09 + r3 * 7.0);   // 0.09→11s 一循环(原站 0.04=25s 太慢看不出动);r3*7 均匀错峰
+      float rise = fract(uTime * 0.0667 + r3 * 7.0);   // 15s 一循环;r3*7 均匀错峰
       float life = smoothstep(0.0, 0.08, rise) * (1.0 - smoothstep(0.82, 1.0, rise));
       life = mix(1.0, life, r);   // 尘埃凝聚完成前不参与
-      float sparse = pow(r2, 60.0) * r;   // 指数 60→约 11% 的点参与上升(原站 300→2%,我们点少要多些才看得见)
+      float sparse = pow(r2, 80.0) * r;   // 指数 80→约 8% 的点参与上升
       pos.y += rise * sparse * uFlowStrength * 7.0 * mix(0.4, 1.2, r1);
       pos.y += sin(uTime + r2 * 20.0) * sparse * uFlowStrength * 0.08;
 
@@ -587,13 +587,17 @@ fetch('forest_points.bin').then(r => {
     colors[i*3] = rgb[i*3]/255; colors[i*3+1] = rgb[i*3+1]/255; colors[i*3+2] = rgb[i*3+2]/255;
     sizes[i] = .5 + Math.random() * .6;
     // 扎根度按"高度+颜色"分类:绿叶随风大摆,树干/小径几乎不动
+    // 叶子要同时满足两个条件:绿色优势 + 高饱和(苔藓灰绿树干是低饱和,会被拦下)
     const R = rgb[i*3] / 255, G = rgb[i*3+1] / 255, B = rgb[i*3+2] / 255;
-    const greenness = G - Math.max(R, B);   // 绿色优势 → 越像叶子
     if (y < .8){
       mobility[i] = .12;                    // 小径/地面:焊死
     } else {
-      const leaf = Math.min(Math.max((greenness + .02) / .10, 0), 1);
-      mobility[i] = .08 + 1.05 * leaf * leaf;   // 棕灰树干 0.08 ←→ 鲜绿叶子 ~1.13
+      const mx = Math.max(R, G, B), mn = Math.min(R, G, B);
+      const sat = (mx - mn) / Math.max(mx, 1e-3);
+      const greenness = G - Math.max(R, B);
+      const leaf = Math.min(Math.max((greenness - .01) / .10, 0), 1) *
+                   Math.min(Math.max((sat - .18) / .22, 0), 1);
+      mobility[i] = .08 + 1.05 * leaf * leaf;   // 树干/灰绿 0.08 ←→ 鲜绿叶子 ~1.13
     }
     homeData[i*4] = x; homeData[i*4+1] = y; homeData[i*4+2] = z; homeData[i*4+3] = mobility[i];
     if ((i & 127) === 0){ ys.push(y); zs.push(z); }
